@@ -55,6 +55,7 @@ namespace OrdererTest
             //Check if configmsg's payload is initialized. If not, it's a normal message.
             if ((IntPtr)msg.ConfigMsg.Payload != IntPtr.Zero) //It's a config message
             {
+                Console.WriteLine("[HandleMessage] config message");
                 //Cut pending batch so we can make and send the block then a config block
                 Batch newbatch = GPUWrapper.Cut(); 
                 if (newbatch.MsgCount > 0)
@@ -68,7 +69,7 @@ namespace OrdererTest
             }
             else //It's a normal message
             {
-
+                Console.WriteLine("[HandleMessage] normal message");
                 Batch Batch1 = new Batch();
                 Batch Batch2 = new Batch();
                 //Stopwatch sw1 = new Stopwatch();
@@ -116,6 +117,7 @@ namespace OrdererTest
 
         public static unsafe void HandleMessageCPU(SafeMessage msg, int index)
         {
+            Console.WriteLine(String.Format("HandleMessageCPU {0}", index));
             //Check if configmsg is initialized. If not, it's a normal message.
             bool config = false;
 
@@ -123,6 +125,7 @@ namespace OrdererTest
             {
                 //Cut pending batch so we can make and send the block then a config block
                 SafeBatch newbatch = Cutter.Cut();
+                Console.WriteLine("Config Message, newbatch message count={0}", newbatch.Messages.Count());
                 if (newbatch.Messages.Count() > 0)
                 {
                     Task.Factory.StartNew(() => MakeBlockCPU(newbatch, false));
@@ -142,6 +145,7 @@ namespace OrdererTest
                 //string output = "Time taken: " + sw1.ElapsedTicks + " ticks" + Environment.NewLine;
                 //Console.WriteLine(output);
                 //Ordered returns 0, 1, or 2 batches, process each one
+                Console.WriteLine("Normal Message, batches: {0}, {1}", OR.Batches[0], OR.Batches[1]);
                 Parallel.For(0, 2, i =>
                 {
                     if (OR.Batches[i] != null)
@@ -235,6 +239,7 @@ namespace OrdererTest
             sw.Start();
             for(int i = 0; i < testnum; i++)
             {
+                Console.WriteLine(String.Format("Test {0}", i));
                 SafeMessage message = msgsjson.ElementAt(index);
                 if (message.ConfigSeq != null) //If message exists
                 {
