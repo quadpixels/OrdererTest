@@ -348,3 +348,7 @@ MigrationBackup/
 
 # Ionide (cross platform F# VS Code tools) working folder
 .ionide/
+/Properties/launchSettings.json
+/OrdererKernel/pch.h
+/OrdererKernel/pch.cpp
+/OrdererKernel/OrdererKernel.vcxproj.filters

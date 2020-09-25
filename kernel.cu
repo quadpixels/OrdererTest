@@ -304,13 +304,16 @@ __global__ void OrderedGPU(Envelope* msg, long len, int* ConditionCode, int inde
     }
 }
 
-__global__ void OrderedGPUUsingMailbox(MailboxEntry* mailbox_entries) {
-  const int tid = blockIdx.x * blockDim.x + threadIdx.x; // Using only 1d thread grid
-  if (tid == 0) {
-    printf("[OrderedGPUUsingMailbox] %d blocks x %d threads per block\n",
-      gridDim.x * gridDim.y * gridDim.z,
-      blockDim.x * blockDim.y * blockDim.z);
-  }
+__global__ void OrderedGPUUsingMailbox(MailboxEntry* mailbox_entries, int tid_override) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x; // Using only 1d thread grid
+
+  if (tid_override < 0) {
+    if (tid == 0) {
+      printf("[OrderedGPUUsingMailbox] %d blocks x %d threads per block\n",
+        gridDim.x * gridDim.y * gridDim.z,
+        blockDim.x * blockDim.y * blockDim.z);
+    }
+  } else tid = tid_override;
 
   volatile MailboxEntry* mailbox = &(mailbox_entries[tid]);
   volatile int* pflag = &(mailbox->flag);
@@ -397,105 +400,109 @@ void CheckError(cudaError_t err, const char* msg) {
 //Condition 3: Cut pending batch, then add msg. This means msg won't be added in OrderedGPU, and will have to have a separate kernel launch to add after cutting in this function.
 //Condition 4: Cut pending batch after adding msg. This is the simplest one to handle.
 //Also, there will be a pending batch after execution if condition is 1, 2, or 4.
+
+// A pool of memory to reduce the number of CUDA runtime API calls
+Envelope* g_msg_d = nullptr;
+char* g_msgpayload_d = nullptr;
+char* g_msgsig_d = nullptr;
+int* g_ConditionCode_d = nullptr;
+
 extern "C" bool __declspec(dllexport) __stdcall Ordered(Envelope msg, Batch * Batch1, Batch * Batch2, int index)
 {
-    cudaError_t err;
-    printf("Ordered start: %i\n", index);
-
-    //Memory for msg
-
-    //Lengths and initial device and host vars
-    long len = strlen(msg.Payload);
-    long siglen = strlen(msg.Signature);
-    Envelope* msg_d;
-    err = cudaMalloc(&msg_d, sizeof(*msg_d));
-    CheckError(err, "1");
-    Envelope msg_h;
-
-    //Payload allocate and copy
-    char* msgpayload_d;
-    err = cudaMalloc(&msgpayload_d, len);
-    CheckError(err, "2");
-    msg_h.Payload = msgpayload_d;
-    err = cudaMemcpy(msgpayload_d, msg.Payload, len, cudaMemcpyHostToDevice);
-    CheckError(err, "2");
-
-    //Signature allocate and copy
-    char* msgsig_d;
-    err = cudaMalloc(&msgsig_d, siglen);
-    CheckError(err, "4");
-    msg_h.Signature = msgsig_d;
-    err = cudaMemcpy(msgsig_d, msg.Signature, siglen, cudaMemcpyHostToDevice);
-    CheckError(err, "5");
-    //Copy everything to device
-    err = cudaMemcpy(msg_d, &msg_h, sizeof(*msg_d), cudaMemcpyHostToDevice);
-    CheckError(err, "6");
-    //Int for the condition code
-    int* ConditionCode_d;
-    err = cudaMalloc(&ConditionCode_d, sizeof(int));
-    CheckError(err, "7");
-    int ConditionCode_h = 0;
-    err = cudaMemcpy(ConditionCode_d, &ConditionCode_h, sizeof(int), cudaMemcpyHostToDevice);
-    CheckError(err, "8");
-
-    //////////Streams test. Currently has same result as using default stream
-
-    //cudaStreamCreate(&streams[index]);
-
-    //cudaStream_t test;
-
-    //cudaStreamCreateWithFlags(&test, cudaStreamNonBlocking);
-
-    ///******************Run GPU function******************/
-    //OrderedGPU<<<1, 1, 0, test>>>(msg_d, len, ConditionCode_d, index);
-
-
-    ////Copy condition code back to CPU
-    //cudaMemcpyAsync(&ConditionCode_h, ConditionCode_d, sizeof(int), cudaMemcpyDeviceToHost, test);
-
-
-    //////////Normal test
-
-  /******************Run GPU function******************/
-  if (true) {
+  const int PAYLOAD_LENGTH = 32;
+  const int SIGNATURE_LENGTH = 32;
+  {
     std::unique_lock<std::mutex> lock(g_mutex);
-    if (g_kernel_launcher_thread == nullptr) {
-      g_kernel_launcher_thread = new std::thread([](){
-        cudaError_t err;
-        err = cudaStreamCreateWithFlags(&(streams[1]), cudaStreamNonBlocking);
-        CheckError(err, "Creating Stream");
-        err = cudaStreamCreateWithFlags(&(streams[2]), cudaStreamNonBlocking);
-        CheckError(err, "Creating Stream 2");
-        err = cudaStreamCreateWithFlags(&(streams[3]), cudaStreamNonBlocking);
-        CheckError(err, "Creating Stream 3");
-        //err = cudaSetDeviceFlags(cudaDeviceMapHost);
-        //CheckError(err, "Set Device Flags");
-        err = cudaHostAlloc(&mailbox_d, sizeof(MailboxEntry)*100, cudaHostAllocMapped);
-        //err = cudaHostAlloc(&mailbox_d, sizeof(MailboxEntry)*100, cudaHostAllocMapped);
-        CheckError(err, "Malloc mailbox entries");
-        err = cudaMemset(mailbox_d, 0, sizeof(MailboxEntry)*100);
-        CheckError(err, "memset mailbox");
-        void* mailbox_d1;
-        //err = cudaHostGetDevicePointer(&mailbox_d1, mailbox_d, 0);
-        //CheckError(err, "Get device-side pointer of mailbox_d");
-        //printf("%p vs %p\n", mailbox_d, mailbox_d1);
-        
-        printf("Mailbox is at %p\n", mailbox_d);
-        OrderedGPUUsingMailbox<<<10, 1, 1, streams[2]>>>(mailbox_d);
-        err = cudaGetLastError();
-        CheckError(err, "launch kernel");
-        err = cudaStreamSynchronize(streams[2]);
-        CheckError(err, "stream sync");
-      });
+    if (g_msg_d == nullptr) {
+      const int N = 16;
+      printf("Allocating a pool of memory on the GPU\n");
+      cudaError_t err;
+      err = cudaMalloc(&g_msg_d, sizeof(Envelope)*N);
+      CheckError(err, "1");
+
+      err = cudaMalloc(&g_msgpayload_d, PAYLOAD_LENGTH * N);
+      CheckError(err, "2");
+
+      err = cudaMalloc(&g_msgsig_d, SIGNATURE_LENGTH * N);
+      CheckError(err, "4");
+
+      err = cudaMalloc(&g_ConditionCode_d, sizeof(int)*N);
+      CheckError(err, "5");
+
+      err = cudaHostAlloc(&mailbox_d, sizeof(MailboxEntry)*100, cudaHostAllocMapped);
+      CheckError(err, "Malloc mailbox entries");
+      err = cudaMemset(mailbox_d, 0, sizeof(MailboxEntry)*100);
+      CheckError(err, "memset mailbox");
+    }
+
+    /******************Run GPU function******************/
+    if (false) {
+      if (g_kernel_launcher_thread == nullptr) {
+        g_kernel_launcher_thread = new std::thread([](){
+          cudaError_t err;
+          err = cudaStreamCreateWithFlags(&(streams[2]), cudaStreamNonBlocking);
+          CheckError(err, "Creating Stream 2");
+          
+          printf("Mailbox is at %p\n", mailbox_d);
+          OrderedGPUUsingMailbox<<<10, 1, 1, streams[2]>>>(mailbox_d, -999);
+          err = cudaGetLastError();
+          CheckError(err, "launch kernel");
+          err = cudaStreamSynchronize(streams[2]);
+          CheckError(err, "stream sync");
+        });
+      }
     }
   }
+  cudaError_t err;
+  printf("Ordered start: %i\n", index);
 
-  if (0) {
-    cudaStreamCreate(&streams[index]);
-    cudaStream_t test;
-    cudaStreamCreateWithFlags(&test, cudaStreamNonBlocking);
-    OrderedGPU<<<1, 1>>>(msg_d, len, ConditionCode_d, index);
-  } else {
+  err = cudaStreamCreateWithFlags(&(streams[1]), cudaStreamNonBlocking);
+  CheckError(err, "Creating Stream");
+
+  //Memory for msg
+
+  //Lengths and initial device and host vars
+  long len = strlen(msg.Payload);
+  long siglen = strlen(msg.Signature);
+  Envelope* msg_d = &(g_msg_d[index]);
+  Envelope msg_h;
+
+  //Payload allocate and copy
+  char* msgpayload_d = &(g_msgpayload_d[index * PAYLOAD_LENGTH]);
+  msg_h.Payload = msgpayload_d;
+  err = cudaMemcpy(msgpayload_d, msg.Payload, len, cudaMemcpyHostToDevice);
+  //err = cudaMemcpyAsync(msgpayload_d, msg.Payload, len, cudaMemcpyHostToDevice, streams[1]);
+  CheckError(err, "2");
+  printf("Ordered copy payload: %i\n", index);
+
+  //Signature allocate and copy
+  char* msgsig_d = &(g_msgsig_d[index * SIGNATURE_LENGTH]);
+  msg_h.Signature = msgsig_d;
+  err = cudaMemcpy(msgsig_d, msg.Signature, siglen, cudaMemcpyHostToDevice);
+  //err = cudaMemcpyAsync(msgsig_d, msg.Signature, siglen, cudaMemcpyHostToDevice, streams[1]);
+  CheckError(err, "5");
+  printf("Ordered copy signature: %i\n", index);
+
+  //Copy everything to device
+  err = cudaMemcpy(msg_d, &msg_h, sizeof(*msg_d), cudaMemcpyHostToDevice);
+  //err = cudaMemcpyAsync(msg_d, &msg_h, sizeof(*msg_d), cudaMemcpyHostToDevice, streams[1]);
+  CheckError(err, "6");
+  printf("Ordered copy msg: %i\n", index);
+
+  //Int for the condition code
+  int* ConditionCode_d = &(g_ConditionCode_d[index]);
+  //err = cudaMalloc(&ConditionCode_d, sizeof(int));
+  CheckError(err, "7");
+  int ConditionCode_h = 0;
+  err = cudaMemcpyAsync(ConditionCode_d, &ConditionCode_h, sizeof(int), cudaMemcpyHostToDevice);
+  //err = cudaMemcpyAsync(ConditionCode_d, &ConditionCode_h, sizeof(int), cudaMemcpyHostToDevice, streams[1]);
+  CheckError(err, "8");
+  printf("Ordered copy condition code: %i\n", index);
+
+  printf("Ordered stream1 sync %i\n", index);
+
+
+  {
 
     _sleep(200); // Wait until the setup is done
 
@@ -508,53 +515,76 @@ extern "C" bool __declspec(dllexport) __stdcall Ordered(Envelope msg, Batch * Ba
     me.len = len;
     me.index = index;
     me.flag = 1;
+    mailbox_d[mailbox_index] = me;
     
-    err = cudaMemcpyAsync(&(mailbox_d[mailbox_index]), &me, sizeof(me), cudaMemcpyHostToDevice, streams[1]);
+    printf(">>>\n");
+    //err = cudaMemcpyAsync(&(mailbox_d[mailbox_index]), &me, sizeof(me), cudaMemcpyHostToDevice, streams[1]);
+    err = cudaMemcpy(&(mailbox_d[mailbox_index]), &me, sizeof(me), cudaMemcpyHostToDevice);
     CheckError(err, "Copying mailbox entry to the device");
+    //err = cudaStreamSynchronize(streams[1]);
+    CheckError(err, "Sync stream 1");
+    printf("<<<\n");
 
     printf("Dispatching index=%d, mailbox_index=%d\n", index, mailbox_index);
+
+    OrderedGPUUsingMailbox<<<1, 1, 1, streams[2]>>>(mailbox_d, index);
 
     // Wait for the flag to be set to 2 by the GPU.
     while (true) {
       _sleep(100);
-      me = mailbox_d[mailbox_index];
+      //me = mailbox_d[mailbox_index];
+      printf(">>>\n");
+      //err = cudaMemcpyAsync(&me, &mailbox_d[mailbox_index], sizeof(me), cudaMemcpyDeviceToHost, streams[1]);
+      err = cudaMemcpy(&me, &mailbox_d[mailbox_index], sizeof(me), cudaMemcpyDeviceToHost);
+      CheckError(err, "async copy back to the host");
+      printf(">>>>\n");
+      //err = cudaStreamSynchronize(streams[1]);
+      //CheckError(err, "sync stream 1 2");
+      printf("<<<< me.flag=%d\n", me.flag);
       if (me.flag == 2) break;
     }
 
     printf("Done index=%d mailbox_index=%d\n", index, mailbox_index);
   }
 
-    //Copy condition code back to CPU
-    cudaMemcpy(&ConditionCode_h, ConditionCode_d, sizeof(int), cudaMemcpyDeviceToHost);
+  //Copy condition code back to CPU
+  // Is stream0 completely blocked ??
+  //cudaMemcpy(&ConditionCode_h, ConditionCode_d, sizeof(int), cudaMemcpyDeviceToHost);
+  err = cudaMemcpyAsync(&ConditionCode_h, ConditionCode_d, sizeof(int), cudaMemcpyDeviceToHost, streams[1]);
+  CheckError(err, "copying back condition code");
 
-    cudaFree(&msg_h);
-    cudaFree(ConditionCode_d);
 
-    //Handle based on condition code
-    //Doing it this way avoids unnecessarily copying batches in/out the GPU
-    Batch1->MsgCount = 0; //Init to 0
-    Batch2->MsgCount = 0;
-    if (ConditionCode_h > 0) //Need to handle something
-    {
-        if (ConditionCode_h < 3) //Need to isolate msg in batch1
-        {
-            Batch1->Messages[0] = msg;
-            Batch1->MsgCount = 1;
-            if (ConditionCode_h == 1) //Also need to cut pending batch
-            {
-                *Batch2 = Cut();
-            }
-        }
-        else //Condition code equals 3 or 4
-        {
-            *Batch2 = Cut();
-            if (ConditionCode_h == 3) //Also need to add msg to pending after cutting
-            {
-                AddToPending(msg, index);
-            }
-        }
-    }
-    return ConditionCode_h == 0 || ConditionCode_h == 3;
+  //Handle based on condition code
+  //Doing it this way avoids unnecessarily copying batches in/out the GPU
+  Batch1->MsgCount = 0; //Init to 0
+  Batch2->MsgCount = 0;
+  if (ConditionCode_h > 0) //Need to handle something
+  {
+      if (ConditionCode_h < 3) //Need to isolate msg in batch1
+      {
+          Batch1->Messages[0] = msg;
+          Batch1->MsgCount = 1;
+          if (ConditionCode_h == 1) //Also need to cut pending batch
+          {
+              *Batch2 = Cut();
+          }
+      }
+      else //Condition code equals 3 or 4
+      {
+          *Batch2 = Cut();
+          if (ConditionCode_h == 3) //Also need to add msg to pending after cutting
+          {
+              AddToPending(msg, index);
+          }
+      }
+  }
+
+  err = cudaStreamDestroy(streams[1]);
+  CheckError(err, "Destroying Stream");
+
+  bool ret = ConditionCode_h == 0 || ConditionCode_h == 3;
+  printf("Ordered %i is done and is returning %d\n", index, ret);
+  return ret;
 }
 
 extern "C" int __declspec(dllexport) __stdcall main()

@@ -29,7 +29,6 @@ namespace OrdererTest
 
     class Program
     {
-
         public const bool useGPU = true; //Change for comparison purposes
 
         public const int Timeout = 120; //Timeout length in seconds
@@ -215,11 +214,11 @@ namespace OrdererTest
                 Interlocked.Increment(ref BlockCount);
                 //Writer.WriteBlock(newblock);
             }
-            //string blockoutput = "Creating " + (config ? "config" : "normal") + " block " + newblock.Header.Number + Environment.NewLine;
-            //blockoutput += "Message count: " + newbatch.MsgCount + Environment.NewLine;
-            //blockoutput += "Time taken: " + (DateTime.Now - blockwritetimer).TotalMilliseconds + "ms" + Environment.NewLine;
-            //blockoutput += "---------------------------------------------------------------------" + Environment.NewLine;
-            //Console.WriteLine(blockoutput);
+            string blockoutput = "Creating " + (config ? "config" : "normal") + " block " + newblock.Header.Number + Environment.NewLine;
+            blockoutput += "Message count: " + newbatch.MsgCount + Environment.NewLine;
+            blockoutput += "Time taken: " + (DateTime.Now - blockwritetimer).TotalMilliseconds + "ms" + Environment.NewLine;
+            blockoutput += "---------------------------------------------------------------------" + Environment.NewLine;
+            Console.WriteLine(blockoutput);
         }
 
 
@@ -239,24 +238,27 @@ namespace OrdererTest
             sw.Start();
             for(int i = 0; i < testnum; i++)
             {
-                Console.WriteLine(String.Format("Test {0}", i));
                 SafeMessage message = msgsjson.ElementAt(index);
                 if (message.ConfigSeq != null) //If message exists
                 {
                     if (useGPU)
                     {
+                        Console.WriteLine(String.Format("Test {0}, HandleMessage posted", i));
                         Message unsafemessage = ConvertToUnsafe(message);
                         int temp = i; //Concurrency issue happens if I don't do this
-                        Task.Factory.StartNew(() => HandleMessage(unsafemessage, temp)); //Run message handler
+                        Task t = Task.Factory.StartNew(() => HandleMessage(unsafemessage, temp)); //Run message handler
+                        t.Wait();
                     }
                     else //Use CPU
                     {
+                        Console.WriteLine(String.Format("Test {0}, HandleMessageCPU posted", i));
                         int temp = i;
                         Task.Factory.StartNew(() => HandleMessageCPU(message, temp)); //Run message handler
                     }
                 }
                 else if (Timer != new DateTime() && (DateTime.Now - Timer).TotalSeconds > Timeout)
                 {
+                    Console.WriteLine(String.Format("Test {0}, HandleTimer posted", i));
                     Timer = new DateTime(); //Reset timer
                     Task.Factory.StartNew(() => HandleTimer());
                 }
